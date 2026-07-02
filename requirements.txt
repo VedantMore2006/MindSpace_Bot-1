@@ -1,0 +1,14 @@
+# FastAPI and Server
+fastapi==0.115.0
+uvicorn[standard]==0.30.6
+pydantic==2.9.2
+
+# Environment Configuration
+python-dotenv==1.0.1
+
+# LLM Libraries (LangChain & Anthropic Claude)
+langchain-core==0.3.10
+langchain-anthropic==0.2.3
+
+# Redis Cache/DB for sessions
+redis==5.0.1
