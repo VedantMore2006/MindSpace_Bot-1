@@ -69,6 +69,7 @@ class ChatRequest(BaseModel):
     message: str = Field(..., description="User's message to the chatbot", min_length=1, max_length=5000)
     session_id: Optional[str] = Field(None, description="Unique session identifier")
     user_id: Optional[str] = Field(None, description="Optional user identifier")
+    user_name: Optional[str] = Field(None, description="Optional user name")
 
     class Config:
         json_schema_extra = {
@@ -147,7 +148,6 @@ class HealthCheckResponse(BaseModel):
 # ============================================================================
 
 _session_store: Dict[str, MindSpaceChatbot] = {}
-_user_session_map: Dict[str, str] = {}
 _session_timestamps: Dict[str, datetime] = {}
 SESSION_TIMEOUT_HOURS = 24
 
@@ -209,30 +209,73 @@ def cleanup_expired_sessions():
         logger.info(f"Cleaned up {len(expired)} expired sessions")
 
 
-def get_or_create_chatbot(session_id: Optional[str] = None, user_id: Optional[str] = None, client_ip: Optional[str] = None) -> MindSpaceChatbot:
+def get_or_create_chatbot(session_id: Optional[str] = None, user_id: Optional[str] = None, client_ip: Optional[str] = None, user_name: Optional[str] = None) -> MindSpaceChatbot:
     """Get or create a chatbot instance for a session."""
     # Cleanup expired sessions periodically
     cleanup_expired_sessions()
     
-    # If user_id is provided and has an existing session, use that
-    if user_id and user_id in _user_session_map:
-        session_id = _user_session_map[user_id]
+    # 1. If user_id is provided and session_id is not, query SQLite for existing session
+    if user_id and not session_id:
+        from db import Session, ChatSession
+        try:
+            with Session() as db_session:
+                db_sess = db_session.query(ChatSession).filter_by(user_id=user_id).first()
+                if db_sess:
+                    session_id = db_sess.session_id
+        except Exception as e:
+            logger.error(f"Error querying session for user_id {user_id}: {e}")
     
-    # If session_id is provided, use that
-    if session_id and session_id in _session_store:
-        _session_timestamps[session_id] = datetime.now()
-        return _session_store[session_id]
-    
-    # Create new session
+    # 2. If session_id is provided, try loading from cache or SQLite
+    if session_id:
+        if session_id in _session_store:
+            _session_timestamps[session_id] = datetime.now()
+            chatbot = _session_store[session_id]
+            if user_name and not chatbot.memory.get_user_name():
+                chatbot.memory.set_user_name(user_name)
+            return chatbot
+        
+        # Cache miss: check SQLite
+        from db import Session, ChatSession
+        try:
+            with Session() as db_session:
+                db_sess = db_session.query(ChatSession).filter_by(session_id=session_id).first()
+                if db_sess:
+                    chatbot = MindSpaceChatbot(session_id)
+                    if user_name and not chatbot.memory.get_user_name():
+                        chatbot.memory.set_user_name(user_name)
+                    if user_id and db_sess.user_id != user_id:
+                        db_sess.user_id = user_id
+                        db_session.commit()
+                    _session_store[session_id] = chatbot
+                    _session_timestamps[session_id] = datetime.now()
+                    return chatbot
+        except Exception as e:
+            logger.error(f"Error restoring session {session_id} from SQLite: {e}")
+
+    # 3. Create new session
     if not session_id:
         session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
     
     chatbot = MindSpaceChatbot(session_id)
+    
+    # Initialize/update fields in SQLite
+    from db import Session, ChatSession
+    try:
+        with Session() as db_session:
+            db_sess = db_session.query(ChatSession).filter_by(session_id=session_id).first()
+            if db_sess:
+                db_sess.user_id = user_id
+                if user_name:
+                    db_sess.user_name = user_name
+                db_session.commit()
+    except Exception as e:
+        logger.error(f"Error saving new session {session_id} details: {e}")
+        
+    if user_name:
+        chatbot.memory.set_user_name(user_name)
+        
     _session_store[session_id] = chatbot
     _session_timestamps[session_id] = datetime.now()
-    
-    if user_id:
-        _user_session_map[user_id] = session_id
     
     return chatbot
 
@@ -272,11 +315,16 @@ def create_session(request: SessionCreateRequest):
         session_id = f"session_{datetime.now().strftime('%Y%m%d_%H%M%S')}_{uuid.uuid4().hex[:8]}"
         
         chatbot = MindSpaceChatbot(session_id)
+        
+        from db import Session, ChatSession
+        with Session() as db_session:
+            db_sess = db_session.query(ChatSession).filter_by(session_id=session_id).first()
+            if db_sess and request.user_id:
+                db_sess.user_id = request.user_id
+                db_session.commit()
+                
         _session_store[session_id] = chatbot
         _session_timestamps[session_id] = datetime.now()
-        
-        if request.user_id:
-            _user_session_map[request.user_id] = session_id
         
         return SessionCreateResponse(
             session_id=session_id,
@@ -312,7 +360,7 @@ def chat(request: ChatRequest, req: Request):
             )
         
         # Get or create chatbot instance
-        chatbot = get_or_create_chatbot(request.session_id, request.user_id, client_ip)
+        chatbot = get_or_create_chatbot(request.session_id, request.user_id, client_ip, request.user_name)
         
         # Get stats before response generation to identify triggers
         stats_before = chatbot.get_stats()
@@ -455,19 +503,14 @@ def reset_session(session_id: str):
 @app.delete("/api/session/{session_id}", dependencies=[Depends(verify_api_key)])
 def delete_session(session_id: str):
     try:
-        if session_id not in _session_store:
-            raise HTTPException(
-                status_code=status.HTTP_404_NOT_FOUND,
-                detail=f"Session {session_id} not found"
-            )
+        # We also need to delete from the SQLite database
+        from conversation_memory import delete_memory
+        delete_memory(session_id)
         
-        del _session_store[session_id]
+        if session_id in _session_store:
+            del _session_store[session_id]
         if session_id in _session_timestamps:
             del _session_timestamps[session_id]
-        
-        for user_id, sess_id in list(_user_session_map.items()):
-            if sess_id == session_id:
-                del _user_session_map[user_id]
         
         return {
             "status": "success",

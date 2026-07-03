@@ -13,12 +13,7 @@ ANTHROPIC_MODEL = os.getenv("ANTHROPIC_MODEL", "claude-3-5-sonnet-latest")
 # Application settings
 MAX_HISTORY_LENGTH = 50
 MAX_CONTEXT_MESSAGES = 20
-MEMORY_FILE_PATH = os.getenv("MEMORY_FILE_PATH", "conversation_memory.json")
-
-# Redis Configuration
-REDIS_HOST = os.getenv("REDIS_HOST", "localhost")
-REDIS_PORT = int(os.getenv("REDIS_PORT", 6379))
-USE_REDIS = os.getenv("USE_REDIS", "False").lower() == "true"
+DB_PATH = os.getenv("DB_PATH", "/app/data/mindspace.db")
 
 # Safety Settings
 CRISIS_DETECTION_ENABLED = os.getenv("CRISIS_DETECTION_ENABLED", "True").lower() == "true"

@@ -10,5 +10,5 @@ python-dotenv==1.0.1
 langchain-core==0.3.10
 langchain-anthropic==0.2.3
 
-# Redis Cache/DB for sessions
-redis==5.0.1
+# SQLite Database ORM
+SQLAlchemy>=2.0.0

@@ -1,35 +1,19 @@
 """
-Conversation memory management with persistence.
+Conversation memory management with SQLite persistence.
 Stores chat history, user info, and provides context for LLM.
 """
 
 import json
-import os
 from datetime import datetime
 from typing import List, Dict, Optional, Any
-from collections import deque
 
-from config import MAX_HISTORY_LENGTH, MAX_CONTEXT_MESSAGES, MEMORY_FILE_PATH, USE_REDIS, REDIS_HOST, REDIS_PORT
-
-# Initialize redis client conditionally
-redis_client = None
-if USE_REDIS:
-    try:
-        # pyrefly: ignore [missing-import]
-        import redis
-        redis_client = redis.Redis(
-            host=REDIS_HOST,
-            port=REDIS_PORT,
-            db=0,
-            decode_responses=True
-        )
-    except ImportError:
-        print("Warning: redis package not installed, falling back to local file storage.")
+from config import MAX_HISTORY_LENGTH, MAX_CONTEXT_MESSAGES
+from db import Session, ChatSession, Message
 
 
 class ConversationMemory:
     """
-    Manages conversation history with persistence.
+    Manages conversation history with SQLite persistence.
     Stores messages, user info, and provides context for LLM.
     """
     
@@ -64,12 +48,12 @@ class ConversationMemory:
         self.stats["total_messages"] += 1
         self.user_info["last_seen"] = datetime.now().isoformat()
         
-        # Trim if exceeds max history
+        # Trim local messages list if it exceeds max history
         if len(self.messages) > MAX_HISTORY_LENGTH:
             self.messages = self.messages[-MAX_HISTORY_LENGTH:]
         
-        # Auto-save after each message
-        self._save_memory()
+        # Save to SQLite database
+        self._save_message_to_db(role, content)
     
     def get_context_for_llm(self, max_messages: int = MAX_CONTEXT_MESSAGES) -> str:
         """
@@ -107,7 +91,7 @@ class ConversationMemory:
     def set_user_name(self, name: str) -> None:
         """Store user's name."""
         self.user_info["name"] = name
-        self._save_memory()
+        self._save_session_metadata()
     
     def get_user_info(self) -> Dict:
         """Get user information."""
@@ -121,12 +105,14 @@ class ConversationMemory:
             "timestamp": datetime.now().isoformat()
         })
         self.stats["crisis_count"] += 1
-        self._save_memory()
+        self._save_session_metadata()
     
     def clear(self) -> None:
         """Clear conversation history but keep user info."""
         self.messages = []
-        self._save_memory()
+        with Session() as db_session:
+            db_session.query(Message).filter_by(session_id=self.session_id).delete()
+            db_session.commit()
     
     def reset_all(self) -> None:
         """Reset everything including user info."""
@@ -137,8 +123,7 @@ class ConversationMemory:
             "last_seen": datetime.now().isoformat()
         }
         self.crisis_flags = []
-        self.stats.clear()
-        self.stats.update({
+        self.stats = {
             "total_messages": 0,
             "crisis_count": 0,
             "crisis_escalations": 0,
@@ -146,66 +131,116 @@ class ConversationMemory:
             "offensive_content_blocks": 0,
             "languages_detected": [],
             "name_learned": False
-        })
-        self._save_memory()
+        }
+        with Session() as db_session:
+            db_session.query(Message).filter_by(session_id=self.session_id).delete()
+            db_sess = db_session.query(ChatSession).filter_by(session_id=self.session_id).first()
+            if db_sess:
+                db_sess.user_name = None
+                db_sess.user_id = None
+                db_sess.last_seen = datetime.now()
+                db_sess.stats_json = json.dumps({
+                    "stats": self.stats,
+                    "crisis_flags": self.crisis_flags
+                })
+            db_session.commit()
     
     def __len__(self) -> int:
         """Return number of messages."""
         return len(self.messages)
     
-    def _get_memory_path(self) -> str:
-        """Get the memory file path for this session."""
-        # Create directory if it doesn't exist
-        os.makedirs(os.path.dirname(MEMORY_FILE_PATH) or ".", exist_ok=True)
-        return f"{MEMORY_FILE_PATH}.{self.session_id}.json"
-    
-    def _save_memory(self) -> None:
-        """Save memory to Redis or fallback local file."""
+    def _save_message_to_db(self, role: str, content: str) -> None:
+        """Save a message directly to SQLite."""
         try:
-            data = {
-                "session_id": self.session_id,
-                "messages": self.messages,
-                "user_info": self.user_info,
-                "crisis_flags": self.crisis_flags,
-                "stats": self.stats,
-                "last_saved": datetime.now().isoformat()
-            }
-            if USE_REDIS and redis_client:
-                # Save key with 24 hours expiry (86400 seconds)
-                redis_client.setex(
-                    f"mindspace:session:{self.session_id}",
-                    24 * 3600,
-                    json.dumps(data, ensure_ascii=False)
+            with Session() as db_session:
+                # Insert the message
+                db_msg = Message(
+                    session_id=self.session_id,
+                    role=role,
+                    content=content,
+                    timestamp=datetime.now()
                 )
-            else:
-                with open(self._get_memory_path(), 'w', encoding='utf-8') as f:
-                    json.dump(data, f, ensure_ascii=False, indent=2)
+                db_session.add(db_msg)
+                
+                # Update the session stats and last_seen
+                db_sess = db_session.query(ChatSession).filter_by(session_id=self.session_id).first()
+                if db_sess:
+                    db_sess.last_seen = datetime.now()
+                    db_sess.user_name = self.user_info.get("name")
+                    db_sess.stats_json = json.dumps({
+                        "stats": self.stats,
+                        "crisis_flags": self.crisis_flags
+                    })
+                db_session.commit()
         except Exception as e:
-            print(f"Error saving memory: {e}")
+            print(f"Error saving message to database: {e}")
+            
+    def _save_memory(self) -> None:
+        """Compatibility wrapper for saving session metadata."""
+        self._save_session_metadata()
+
+    def _save_session_metadata(self) -> None:
+        """Save session metadata (user info, stats) to SQLite."""
+        try:
+            with Session() as db_session:
+                db_sess = db_session.query(ChatSession).filter_by(session_id=self.session_id).first()
+                if db_sess:
+                    db_sess.last_seen = datetime.now()
+                    db_sess.user_name = self.user_info.get("name")
+                    db_sess.stats_json = json.dumps({
+                        "stats": self.stats,
+                        "crisis_flags": self.crisis_flags
+                    })
+                db_session.commit()
+        except Exception as e:
+            print(f"Error saving session metadata to database: {e}")
     
     def _load_memory(self) -> None:
-        """Load memory from Redis or fallback local file."""
+        """Load memory and messages from SQLite."""
         try:
-            loaded_data = None
-            if USE_REDIS and redis_client:
-                data_str = redis_client.get(f"mindspace:session:{self.session_id}")
-                if data_str:
-                    loaded_data = json.loads(data_str)
-            else:
-                path = self._get_memory_path()
-                if os.path.exists(path):
-                    with open(path, 'r', encoding='utf-8') as f:
-                        loaded_data = json.load(f)
-            
-            if loaded_data:
-                self.messages = loaded_data.get("messages", [])
-                self.user_info = loaded_data.get("user_info", self.user_info)
-                self.crisis_flags = loaded_data.get("crisis_flags", [])
-                loaded_stats = loaded_data.get("stats", {})
-                for k, v in loaded_stats.items():
-                    self.stats[k] = v
+            with Session() as db_session:
+                db_sess = db_session.query(ChatSession).filter_by(session_id=self.session_id).first()
+                
+                if not db_sess:
+                    # Create new session entry
+                    db_sess = ChatSession(
+                        session_id=self.session_id,
+                        user_id=None,
+                        user_name=None,
+                        created_at=datetime.now(),
+                        last_seen=datetime.now(),
+                        stats_json=json.dumps({
+                            "stats": self.stats,
+                            "crisis_flags": self.crisis_flags
+                        })
+                    )
+                    db_session.add(db_sess)
+                    db_session.commit()
+                else:
+                    self.user_info = {
+                        "name": db_sess.user_name,
+                        "first_seen": db_sess.created_at.isoformat() if db_sess.created_at else datetime.now().isoformat(),
+                        "last_seen": db_sess.last_seen.isoformat() if db_sess.last_seen else datetime.now().isoformat()
+                    }
+                    if db_sess.stats_json:
+                        try:
+                            stats_data = json.loads(db_sess.stats_json)
+                            self.stats = stats_data.get("stats", self.stats)
+                            self.crisis_flags = stats_data.get("crisis_flags", [])
+                        except Exception:
+                            pass
+                
+                # Fetch history messages
+                db_messages = db_session.query(Message).filter_by(session_id=self.session_id).order_by(Message.id.asc()).all()
+                self.messages = []
+                for msg in db_messages:
+                    self.messages.append({
+                        "role": msg.role,
+                        "content": msg.content,
+                        "timestamp": msg.timestamp.isoformat() if msg.timestamp else datetime.now().isoformat()
+                    })
         except Exception as e:
-            print(f"Error loading memory: {e}")
+            print(f"Error loading memory from database: {e}")
     
     def get_stats(self) -> Dict:
         """Get memory statistics."""
@@ -248,17 +283,11 @@ def delete_memory(session_id: str) -> None:
         _memory_store[session_id].reset_all()
         del _memory_store[session_id]
         
-    # Delete from Redis if enabled
-    if USE_REDIS and redis_client:
-        try:
-            redis_client.delete(f"mindspace:session:{session_id}")
-        except Exception as e:
-            print(f"Error deleting memory from Redis: {e}")
-            
-    # Also delete the file
+    # Delete from SQLite
     try:
-        path = f"{MEMORY_FILE_PATH}.{session_id}.json"
-        if os.path.exists(path):
-            os.remove(path)
+        with Session() as db_session:
+            db_session.query(Message).filter_by(session_id=session_id).delete()
+            db_session.query(ChatSession).filter_by(session_id=session_id).delete()
+            db_session.commit()
     except Exception as e:
-        print(f"Error deleting memory file: {e}")
+        print(f"Error deleting memory from SQLite: {e}")
